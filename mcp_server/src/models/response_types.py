@@ -41,3 +41,11 @@ class EpisodeSearchResponse(TypedDict):
 class StatusResponse(TypedDict):
     status: str
     message: str
+
+class DocumentUploadResponse(TypedDict):
+    """Structured response from the upload_document tool."""
+    message: str
+    file_name: str
+    total_chunks: int
+    total_characters: int
+    group_id: str
