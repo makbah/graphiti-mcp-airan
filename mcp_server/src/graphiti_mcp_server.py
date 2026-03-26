@@ -34,6 +34,7 @@ from models.response_types import (
 from services.factories import DatabaseDriverFactory, EmbedderFactory, LLMClientFactory
 from services.queue_service import QueueService
 from utils.formatting import format_fact_result
+from utils.document_processor import ChunkingConfig, create_document_chunks
 
 # Load .env file from mcp_server directory
 mcp_server_dir = Path(__file__).parent.parent
@@ -403,6 +404,119 @@ async def add_memory(
         logger.error(f'Error queuing episode: {error_msg}')
         return ErrorResponse(error=f'Error queuing episode: {error_msg}')
 
+@mcp.tool()
+async def upload_document(
+    file_path: str,
+    group_id: str | None = None,
+    source_description: str = '',
+    chunk_size: int = 1500,
+    chunk_overlap: int = 200,
+) -> 'SuccessResponse | ErrorResponse':
+    """Upload a document from a file path, extract its text, chunk it, and add
+    every chunk to the knowledge graph as a separate episode.
+ 
+    Supported file types:
+    - Plain text / markup: .txt, .md, .rst, .csv, .log, .yaml, .yml,
+                           .json, .toml, .ini, .env
+    - Source code:         .py, .js, .ts, .jsx, .tsx, .java, .cpp, .c,
+                           .h, .cs, .go, .rs, .rb, .php, .swift, .kt,
+                           .scala, .sh, .bash, .sql, .html, .css, .xml,
+                           .r, .m, .lua
+    - PDF:                 .pdf  (requires: pip install pypdf)
+    - Word documents:      .docx, .doc  (requires: pip install python-docx)
+ 
+    In Cursor you can reference a file with @<filename> and its path will be
+    inserted here automatically.
+ 
+    Each chunk is queued as an independent episode under the same group_id so
+    that it integrates with search_memory_nodes / search_memory_facts just like
+    any other add_memory call.
+ 
+    Args:
+        file_path: Absolute or relative path to the document file.
+        group_id: Knowledge-graph namespace. Defaults to the server's
+                  configured group_id.
+        source_description: Human-readable description of the source
+                            (e.g. "API design spec", "meeting transcript").
+                            Defaults to the file name.
+        chunk_size: Target number of characters per chunk (default 1500).
+                    Smaller values → more granular retrieval.
+                    Larger values → more context per chunk.
+        chunk_overlap: Characters of overlap between consecutive chunks
+                       (default 200). Overlap helps avoid cutting context
+                       at chunk boundaries.
+    """
+    global graphiti_service, queue_service
+ 
+    if graphiti_service is None or queue_service is None:
+        return ErrorResponse(error='Services not initialized')
+ 
+    try:
+        from graphiti_core.nodes import EpisodeType
+ 
+        # Resolve chunking config
+        chunking_config = ChunkingConfig(
+            chunk_size=max(200, chunk_size),
+            chunk_overlap=max(0, min(chunk_overlap, chunk_size // 2)),
+        )
+ 
+        # Extract text and produce chunks
+        try:
+            chunks = create_document_chunks(file_path, chunking_config)
+        except FileNotFoundError as exc:
+            return ErrorResponse(error=str(exc))
+        except ValueError as exc:
+            return ErrorResponse(error=str(exc))
+        except RuntimeError as exc:
+            return ErrorResponse(error=str(exc))
+ 
+        if not chunks:
+            return ErrorResponse(
+                error=f'No text could be extracted from {file_path}. '
+                      'The file may be empty or unreadable.'
+            )
+ 
+        effective_group_id = group_id or config.graphiti.group_id
+        file_name = chunks[0].metadata['file_name']
+        effective_description = source_description or file_name
+ 
+        # Queue every chunk as a separate episode
+        for chunk in chunks:
+            episode_name = (
+                f'{file_name} — chunk {chunk.chunk_index + 1}/{chunk.total_chunks}'
+            )
+            # Prefix chunk content with provenance so the LLM has context
+            episode_body = (
+                f'[Source: {effective_description} | '
+                f'Chunk {chunk.chunk_index + 1} of {chunk.total_chunks} | '
+                f'Characters {chunk.start_char}–{chunk.end_char}]\n\n'
+                f'{chunk.content}'
+            )
+ 
+            await queue_service.add_episode(
+                group_id=effective_group_id,
+                name=episode_name,
+                content=episode_body,
+                source_description=effective_description,
+                episode_type=EpisodeType.text,
+                entity_types=graphiti_service.entity_types,
+                uuid=None,
+            )
+ 
+        total_chars = chunks[-1].end_char if chunks else 0
+        return SuccessResponse(
+            message=(
+                f"Document '{file_name}' queued for processing: "
+                f"{len(chunks)} chunk(s), ~{total_chars} characters, "
+                f"group '{effective_group_id}'"
+            )
+        )
+ 
+    except Exception as exc:
+        error_msg = str(exc)
+        logger.error(f'Error uploading document: {error_msg}')
+        return ErrorResponse(error=f'Error uploading document: {error_msg}')
+ 
 
 @mcp.tool()
 async def search_nodes(
